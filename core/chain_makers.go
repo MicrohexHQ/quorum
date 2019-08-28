@@ -17,6 +17,7 @@
 package core
 
 import (
+	"encoding/binary"
 	"fmt"
 	"math/big"
 
@@ -231,6 +232,10 @@ func makeHeader(chain consensus.ChainReader, parent *types.Block, state *state.S
 	} else {
 		time = new(big.Int).Add(parent.Time(), big.NewInt(10)) // block time is fixed at 10 seconds
 	}
+	var nanotime big.Int
+	nanotime.Mul(time, big.NewInt(1000000000))
+	extra := make([]byte, 32)
+	binary.BigEndian.PutUint64(extra[24:], nanotime.Uint64())
 
 	return &types.Header{
 		Root:       state.IntermediateRoot(chain.Config().IsEIP158(parent.Number())),
@@ -245,6 +250,7 @@ func makeHeader(chain consensus.ChainReader, parent *types.Block, state *state.S
 		GasLimit: CalcGasLimit(parent, parent.GasLimit(), parent.GasLimit()),
 		Number:   new(big.Int).Add(parent.Number(), common.Big1),
 		Time:     time,
+		Extra:    extra,
 	}
 }
 

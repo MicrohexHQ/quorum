@@ -17,6 +17,7 @@
 package raft
 
 import (
+	"encoding/binary"
 	"fmt"
 	"math/big"
 	"sync"
@@ -40,7 +41,8 @@ import (
 )
 
 var (
-	extraVanity = 32 // Fixed number of extra-data prefix bytes reserved for arbitrary signer vanity
+	extraVanity  = 32 // Fixed number of extra-data prefix bytes reserved for arbitrary signer vanity
+	extraSealLen = 70 // length of extraSealBytes returned by buildExtraSeal.
 )
 
 // Current state information for building the next block
@@ -240,23 +242,21 @@ func (minter *minter) mintingLoop() {
 	}
 }
 
-func generateNanoTimestamp(parent *types.Block) (tstamp int64) {
-	parentTime := parent.Time().Int64()
-	tstamp = time.Now().UnixNano()
-
-	if parentTime >= tstamp {
-		// Each successive block needs to be after its predecessor.
-		tstamp = parentTime + 1
-	}
-
-	return
-}
-
 // Assumes mu is held.
 func (minter *minter) createWork() *work {
 	parent := minter.speculativeChain.head
 	parentNumber := parent.Number()
-	tstamp := generateNanoTimestamp(parent)
+	parentTime := parent.Time().Int64()
+	now := time.Now()
+	var tstamp int64
+	if minter.config.RaftSeconds {
+		tstamp = now.Unix()
+	} else { // integrating `generateNanoTimestamp` into the body of `createWork`, because we need `now` below.
+		tstamp = now.UnixNano()
+		if parentTime >= tstamp {
+			tstamp = parentTime + 1
+		}
+	}
 
 	header := &types.Header{
 		ParentHash: parent.Hash(),
@@ -266,7 +266,10 @@ func (minter *minter) createWork() *work {
 		GasUsed:    0,
 		Coinbase:   minter.coinbase,
 		Time:       big.NewInt(tstamp),
+		Extra:      make([]byte, extraVanity+extraSealLen),
 	}
+	// storing the (little endian) nanosecond time in the vanity space.
+	binary.BigEndian.PutUint64(header.Extra[extraVanity-8:extraVanity], uint64(now.UnixNano()))
 
 	publicState, privateState, err := minter.chain.StateAt(parent.Root())
 	if err != nil {
@@ -312,7 +315,10 @@ func (minter *minter) mintNewBlock() {
 
 	work := minter.createWork()
 	transactions := minter.getTransactions()
+	header := work.header
 
+	var number common.Hash
+	binary.BigEndian.PutUint64(number[24:], header.Number.Uint64()) // put it in the map, _for our own validation!_
 	committedTxes, publicReceipts, privateReceipts, logs := work.commitTransactions(transactions, minter.chain)
 	txCount := len(committedTxes)
 
@@ -322,8 +328,6 @@ func (minter *minter) mintNewBlock() {
 	}
 
 	minter.firePendingBlockEvents(logs)
-
-	header := work.header
 
 	// commit state root after all state transitions.
 	ethash.AccumulateRewards(minter.chain.Config(), work.publicState, header, nil)
@@ -341,10 +345,7 @@ func (minter *minter) mintNewBlock() {
 
 	//Sign the block and build the extraSeal struct
 	extraSealBytes := minter.buildExtraSeal(headerHash)
-
 	// add vanity and seal to header
-	// NOTE: leaving vanity blank for now as a space for any future data
-	header.Extra = make([]byte, extraVanity+len(extraSealBytes))
 	copy(header.Extra[extraVanity:], extraSealBytes)
 
 	block := types.NewBlock(header, committedTxes, nil, publicReceipts)
@@ -438,7 +439,7 @@ func (minter *minter) buildExtraSeal(headerHash common.Hash) []byte {
 
 	var extra extraSeal
 	extra = extraSeal{
-		RaftId:    []byte(raftIdString[2:]), //remove the 0x prefix
+		RaftId:    []byte(raftIdString[2:]), // this looks like a bug. it will ascii encode the hex chars, not hex encode -BD
 		Signature: sig,
 	}
 
